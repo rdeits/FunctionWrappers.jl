@@ -14,15 +14,11 @@ module FunctionWrappers
                    """), Void, Tuple{Bool}, v)
 end
 
-@static if isdefined(Base, Symbol("@nospecialize"))
-    is_singleton(@nospecialize(T)) = isdefined(T, :instance)
-else
-    is_singleton(T::ANY) = isdefined(T, :instance)
-end
+is_singleton(@nospecialize(T)) = isdefined(T, :instance)
 
 # Convert return type and generates cfunction signatures
 Base.@pure map_rettype(T) =
-    (isbits(T) || T === Any || is_singleton(T)) ? T : Ref{T}
+    (isbitstype(T) || T === Any || is_singleton(T)) ? T : Ref{T}
 Base.@pure function map_cfunc_argtype(T)
     if is_singleton(T)
         return Ref{T}
@@ -38,48 +34,30 @@ end
 Base.@pure get_cfunc_argtype(Obj, Args) =
     Tuple{Ref{Obj}, (map_cfunc_argtype(Arg) for Arg in Args.parameters)...}
 
-# Call wrapper since `cfunction` does not support non-function
-# or closures
-if VERSION >= v"0.6.0"
-    # Can in princeple be lower but 0.6 doesn't warn on this so it doesn't matter
-    eval(parse("struct CallWrapper{Ret} <: Function end"))
-else
-    include_string("immutable CallWrapper{Ret} <: Function end")
-end
-(::CallWrapper{Ret}){Ret}(f, args...)::Ret = f(args...)
-
-# Specialized wrapper for
-for nargs in 0:128
-    @eval (::CallWrapper{Ret}){Ret}(f, $((Symbol("arg", i) for i in 1:nargs)...))::Ret =
-        f($((Symbol("arg", i) for i in 1:nargs)...))
+@generated function _cfunction(obj::objT, ::Type{Ret}, ::Type{Args}) where {objT,Ret,Args}
+    :(@cfunction($(Expr(:$, obj)), map_rettype(Ret), (Ref{objT}, $([:(map_cfunc_argtype($Arg)) for Arg in Args.parameters]...))))
 end
 
-let ex = if VERSION >= v"0.6.0"
-    # Can in princeple be lower but 0.6 doesn't warn on this so it doesn't matter
-    parse("mutable struct FunctionWrapper{Ret,Args<:Tuple} end")
-else
-    parse("type FunctionWrapper{Ret,Args<:Tuple} end")
-end
-    ex.args[3] = quote
-        ptr::Ptr{Void}
-        objptr::Ptr{Void}
-        obj
-        objT
-        function (::Type{FunctionWrapper{Ret,Args}}){Ret,Args,objT}(obj::objT)
-            objref = Base.cconvert(Ref{objT}, obj)
-            new{Ret,Args}(cfunction(CallWrapper{Ret}(), map_rettype(Ret),
-                                    get_cfunc_argtype(objT, Args)),
-                          Base.unsafe_convert(Ref{objT}, objref), objref, objT)
-        end
-        (::Type{FunctionWrapper{Ret,Args}}){Ret,Args}(obj::FunctionWrapper{Ret,Args}) = obj
+mutable struct FunctionWrapper{Ret,Args<:Tuple}
+    ptr::Ptr{Cvoid}
+    objptr::Ptr{Cvoid}
+    obj
+    objT
+    function FunctionWrapper{Ret,Args}(obj::objT) where {Ret,Args,objT}
+        objref = Base.cconvert(Ref{objT}, obj)
+        cf = _cfunction(obj, Ret, Args)
+        new{Ret,Args}(cf, Base.unsafe_convert(Ref{objT}, objref), objref, objT)
+        # new{Ret,Args}(cfunction(CallWrapper{Ret}(), map_rettype(Ret),
+        #                         get_cfunc_argtype(objT, Args)),
+                      # Base.unsafe_convert(Ref{objT}, objref), objref, objT)
     end
-    eval(ex)
+    FunctionWrapper{Ret,Args}(obj::FunctionWrapper{Ret,Args}) where {Ret,Args} = obj
 end
 
-Base.convert{T<:FunctionWrapper}(::Type{T}, obj) = T(obj)
-Base.convert{T<:FunctionWrapper}(::Type{T}, obj::T) = obj
+Base.convert(::Type{T}, obj) where {T<:FunctionWrapper} = T(obj)
+Base.convert(::Type{T}, obj::T) where {T<:FunctionWrapper} = obj
 
-@noinline function reinit_wrapper{Ret,Args}(f::FunctionWrapper{Ret,Args})
+@noinline function reinit_wrapper(f::FunctionWrapper{Ret,Args}) where {Ret,Args}
     objref = f.obj
     objT = f.objT
     ptr = cfunction(CallWrapper{Ret}(), map_rettype(Ret),
@@ -89,7 +67,7 @@ Base.convert{T<:FunctionWrapper}(::Type{T}, obj::T) = obj
     return ptr
 end
 
-@generated function do_ccall{Ret,Args}(f::FunctionWrapper{Ret,Args}, args::Args)
+@generated function do_ccall(f::FunctionWrapper{Ret,Args}, args::Args) where {Ret,Args}
     # Has to be generated since the arguments type of `ccall` does not allow
     # anything other than tuple (i.e. `@pure` function doesn't work).
     quote
@@ -102,7 +80,7 @@ end
         assume(ptr != C_NULL)
         objptr = f.objptr
         ccall(ptr, $(map_rettype(Ret)),
-              (Ptr{Void}, $((map_argtype(Arg) for Arg in Args.parameters)...)),
+              (Ptr{Cvoid}, $((map_argtype(Arg) for Arg in Args.parameters)...)),
               objptr, $((:(args[$i]) for i in 1:length(Args.parameters))...))
     end
 end
